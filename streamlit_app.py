@@ -4,46 +4,40 @@ from fpdf import FPDF
 import datetime
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Dashboard de Retrabajo", layout="wide")
-st.title("Generador de Reportes de Retrabajo")
+# Usamos un layout centrado para que se vea más limpio
+st.set_page_config(page_title="Generador de Reportes", layout="centered")
+
+st.title("📄 Reporte de Retrabajo")
+st.markdown("Selecciona el rango de fechas para generar y descargar tu reporte en PDF.")
 
 # --- CARGA DE DATOS ---
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1l6a6ab82p_Nm0g0RdprVR7AWSvMgYjRp-16M1210hMU/export?format=csv&gid=1779842834"
 
-@st.cache_data(ttl=600)  # Actualiza los datos cada 10 minutos
+@st.cache_data(ttl=600)
 def load_data(url):
     df = pd.read_csv(url)
-    # Limpiamos espacios en blanco al inicio o final de los nombres de columnas
     df.columns = df.columns.str.strip() 
     return df
 
-# Intentamos cargar los datos
 try:
     df = load_data(SHEET_URL)
     
-    # --- BLOQUE DE DIAGNÓSTICO INTELIGENTE ---
-    if 'Cantidad de Piezas OK' not in df.columns:
-        st.error("🚨 ALERTA DE DIAGNÓSTICO: No se encontró la columna 'Cantidad de Piezas OK'.")
-        st.warning("Aquí tienes la lista EXACTA de columnas que la aplicación está descargando del enlace:")
-        
-        # Mostramos la lista de columnas en pantalla
-        st.write(df.columns.tolist())
-        
-        st.info("👉 PISTA: Si en la lista de arriba ves palabras como '<!DOCTYPE html>', 'html' o 'body', significa que tu Google Sheet sigue 'Restringido' y Google nos está enviando una página de inicio de sesión en lugar de tu tabla. Si ves tus columnas normales, busca diferencias sutiles de texto.")
-        st.stop() # Detenemos la app aquí para que puedas ver el mensaje
-    # -----------------------------------------
-    
-    # Si todo está bien, convertimos los datos a los formatos correctos
+    # Convertir a formatos correctos
     df['Fecha'] = pd.to_datetime(df['Fecha'], format='%d/%m/%Y', errors='coerce')
     df['Cantidad de Piezas OK'] = pd.to_numeric(df['Cantidad de Piezas OK'], errors='coerce').fillna(0)
     df['Cantidad de Pieza Scrap'] = pd.to_numeric(df['Cantidad de Pieza Scrap'], errors='coerce').fillna(0)
+    
+    # Crear columna de total por fila para facilitar los cálculos del Top 15
+    df['Total Piezas Fila'] = df['Cantidad de Piezas OK'] + df['Cantidad de Pieza Scrap']
+    
+    # Asegurar que la columna de piezas sea texto
+    df['Que pieza va a retrabajar?'] = df['Que pieza va a retrabajar?'].fillna('Sin especificar').astype(str)
 
 except Exception as e:
     st.error(f"Error general al conectarse con el Google Sheet. Detalles: {e}")
     st.stop()
 
 # --- FILTROS DE FECHA ---
-st.subheader("Filtro por Rango de Fechas")
 col1, col2 = st.columns(2)
 
 min_date = df['Fecha'].min().date() if pd.notnull(df['Fecha'].min()) else datetime.date.today()
@@ -54,6 +48,7 @@ with col1:
 with col2:
     fecha_fin = st.date_input("Fecha de Fin", max_date)
 
+# Filtrar dataframe
 mask = (df['Fecha'].dt.date >= fecha_inicio) & (df['Fecha'].dt.date <= fecha_fin)
 df_filtrado = df.loc[mask].copy()
 
@@ -61,92 +56,128 @@ if df_filtrado.empty:
     st.warning("No hay datos para el rango de fechas seleccionado.")
     st.stop()
 
-# --- CÁLCULOS ---
+# --- CÁLCULOS PARA EL PDF ---
+# 1. Calcular el tiempo de RT (Fin - Inicio)
 def calcular_horas(df, col_inicio, col_fin):
     try:
         inicio = pd.to_timedelta(df[col_inicio].astype(str).str.strip() + ':00', errors='coerce')
         fin = pd.to_timedelta(df[col_fin].astype(str).str.strip() + ':00', errors='coerce')
         diferencia = (fin - inicio).dt.total_seconds() / 3600.0
-        diferencia = diferencia.apply(lambda x: x + 24 if x < 0 else x)
+        diferencia = diferencia.apply(lambda x: x + 24 if x < 0 else x) # Por si pasa la medianoche
         return diferencia.fillna(0)
     except:
         return pd.Series([0] * len(df))
 
 df_filtrado['Tiempo de RT (hrs)'] = calcular_horas(df_filtrado, 'Inicio del Retrabajo', 'Fin del retrabajo')
-parada1 = calcular_horas(df_filtrado, 'Inicio de Parada', 'Fin de Parada')
-parada2 = calcular_horas(df_filtrado, 'Inicio de Parada - 2', 'Fin de Parada - 2')
-df_filtrado['Tiempo de Parada (hrs)'] = parada1 + parada2
 
+# Totales Superiores
 total_ok = df_filtrado['Cantidad de Piezas OK'].sum()
 total_scrap = df_filtrado['Cantidad de Pieza Scrap'].sum()
 total_piezas_retrabajadas = total_ok + total_scrap
 total_tiempo_rt = df_filtrado['Tiempo de RT (hrs)'].sum()
-total_tiempo_parada = df_filtrado['Tiempo de Parada (hrs)'].sum()
 
-# --- VISTA PREVIA ---
-st.subheader("Resumen del Periodo")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Total Piezas Retrabajadas", f"{int(total_piezas_retrabajadas)}")
-m2.metric("Total Piezas OK", f"{int(total_ok)}")
-m3.metric("Total Piezas Scrap", f"{int(total_scrap)}")
-m4.metric("Tiempo Total de RT (hrs)", f"{total_tiempo_rt:.2f}")
+# 2. Top 15 Piezas Retrabajadas
+top_15_piezas = df_filtrado.groupby('Que pieza va a retrabajar?')['Total Piezas Fila'].sum().reset_index()
+top_15_piezas = top_15_piezas.sort_values(by='Total Piezas Fila', ascending=False).head(15)
 
-st.dataframe(df_filtrado[['Fecha', 'Operador', 'Inicio del Retrabajo', 'Fin del retrabajo', 'Cantidad de Piezas OK', 'Cantidad de Pieza Scrap']])
+# 3. Listado de Piezas con Scrap
+piezas_scrap = df_filtrado.groupby('Que pieza va a retrabajar?')['Cantidad de Pieza Scrap'].sum().reset_index()
+# Filtramos solo las que tienen scrap mayor a 0 y ordenamos de mayor a menor
+piezas_scrap = piezas_scrap[piezas_scrap['Cantidad de Pieza Scrap'] > 0].sort_values(by='Cantidad de Pieza Scrap', ascending=False)
 
 # --- GENERACIÓN DEL PDF ---
 def generar_pdf():
     pdf = FPDF()
     pdf.add_page()
     
+    # Título y Periodo
     pdf.set_font("Helvetica", style="B", size=16)
     pdf.cell(0, 10, "Reporte de Retrabajo de Piezas", ln=True, align='C')
-    pdf.set_font("Helvetica", size=12)
+    pdf.set_font("Helvetica", size=11)
     pdf.cell(0, 10, f"Periodo: {fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')}", ln=True, align='C')
-    pdf.ln(10)
+    pdf.ln(5)
     
+    # ---------------------------------------------------------
+    # SECCIÓN 1: TOTALES GLOBALES
+    # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
-    pdf.cell(0, 10, "Resumen Global:", ln=True)
-    pdf.set_font("Helvetica", size=12)
-    pdf.cell(0, 10, f"- Piezas Retrabajadas Totales: {int(total_piezas_retrabajadas)}", ln=True)
-    pdf.cell(0, 10, f"- Cantidad de Piezas OK: {int(total_ok)}", ln=True)
-    pdf.cell(0, 10, f"- Cantidad de Piezas Scrap: {int(total_scrap)}", ln=True)
-    pdf.cell(0, 10, f"- Tiempo Total de Retrabajo: {total_tiempo_rt:.2f} horas", ln=True)
-    pdf.cell(0, 10, f"- Tiempo Total de Parada: {total_tiempo_parada:.2f} horas", ln=True)
-    pdf.ln(10)
+    pdf.cell(0, 10, "1. Resumen Global", ln=True)
+    pdf.set_font("Helvetica", size=11)
     
+    # Dibujamos un pequeño cuadro de resumen
+    pdf.cell(80, 8, "Total de Piezas Retrabajadas:", border=0)
+    pdf.cell(40, 8, str(int(total_piezas_retrabajadas)), border=0, ln=True)
+    
+    pdf.cell(80, 8, "Total Piezas OK:", border=0)
+    pdf.cell(40, 8, str(int(total_ok)), border=0, ln=True)
+    
+    pdf.cell(80, 8, "Total Piezas Scrap:", border=0)
+    pdf.cell(40, 8, str(int(total_scrap)), border=0, ln=True)
+    
+    pdf.cell(80, 8, "Tiempo Total de RT (Hrs):", border=0)
+    pdf.cell(40, 8, f"{total_tiempo_rt:.2f}", border=0, ln=True)
+    pdf.ln(5)
+    
+    # ---------------------------------------------------------
+    # SECCIÓN 2: TOP 15 PIEZAS RETRABAJADAS
+    # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
-    pdf.cell(0, 10, "Detalle de Registros:", ln=True)
+    pdf.cell(0, 10, "2. Top 15 Piezas Retrabajadas", ln=True)
     
-    ancho_cols = [25, 30, 20, 20, 20, 20, 25, 25]
-    encabezados = ['Fecha', 'Operador', 'Inicio RT', 'Fin RT', 'Ini Parada', 'Fin Parada', 'Piezas OK', 'Scrap']
+    # Encabezados de tabla
+    pdf.set_font("Helvetica", style="B", size=10)
+    pdf.cell(140, 8, "Nombre de la Pieza", border=1, align='C')
+    pdf.cell(40, 8, "Cantidad Total", border=1, align='C', ln=True)
     
-    pdf.set_font("Helvetica", size=10)
-    for an, enc in zip(ancho_cols, encabezados):
-        pdf.cell(an, 10, enc, border=1, align='C')
-    pdf.ln()
-    
+    # Filas de tabla
     pdf.set_font("Helvetica", size=9)
-    for _, row in df_filtrado.iterrows():
-        fecha_str = row['Fecha'].strftime('%d/%m/%Y') if pd.notnull(row['Fecha']) else ''
-        pdf.cell(ancho_cols[0], 10, fecha_str, border=1)
-        pdf.cell(ancho_cols[1], 10, str(row['Operador'])[:15], border=1) 
-        pdf.cell(ancho_cols[2], 10, str(row['Inicio del Retrabajo']), border=1, align='C')
-        pdf.cell(ancho_cols[3], 10, str(row['Fin del retrabajo']), border=1, align='C')
-        pdf.cell(ancho_cols[4], 10, str(row['Inicio de Parada']), border=1, align='C')
-        pdf.cell(ancho_cols[5], 10, str(row['Fin de Parada']), border=1, align='C')
-        pdf.cell(ancho_cols[6], 10, str(int(row['Cantidad de Piezas OK'])), border=1, align='C')
-        pdf.cell(ancho_cols[7], 10, str(int(row['Cantidad de Pieza Scrap'])), border=1, align='C')
-        pdf.ln()
+    for _, row in top_15_piezas.iterrows():
+        # Truncar el nombre de la pieza a 80 caracteres para que no rompa la tabla
+        nombre_pieza = str(row['Que pieza va a retrabajar?'])[:80] 
+        cantidad = str(int(row['Total Piezas Fila']))
+        
+        pdf.cell(140, 8, nombre_pieza, border=1)
+        pdf.cell(40, 8, cantidad, border=1, align='C', ln=True)
+    
+    pdf.ln(5)
+    
+    # ---------------------------------------------------------
+    # SECCIÓN 3: PIEZAS QUE GENERARON SCRAP
+    # ---------------------------------------------------------
+    pdf.set_font("Helvetica", style="B", size=12)
+    pdf.cell(0, 10, "3. Listado de Piezas con Scrap", ln=True)
+    
+    if piezas_scrap.empty:
+        pdf.set_font("Helvetica", size=10)
+        pdf.cell(0, 10, "No se registraron piezas con Scrap en este periodo.", ln=True)
+    else:
+        # Encabezados de tabla
+        pdf.set_font("Helvetica", style="B", size=10)
+        pdf.cell(140, 8, "Nombre de la Pieza", border=1, align='C')
+        pdf.cell(40, 8, "Cantidad Scrap", border=1, align='C', ln=True)
+        
+        # Filas de tabla
+        pdf.set_font("Helvetica", size=9)
+        for _, row in piezas_scrap.iterrows():
+            nombre_pieza = str(row['Que pieza va a retrabajar?'])[:80]
+            cantidad_scrap = str(int(row['Cantidad de Pieza Scrap']))
+            
+            pdf.cell(140, 8, nombre_pieza, border=1)
+            pdf.cell(40, 8, cantidad_scrap, border=1, align='C', ln=True)
 
+    # Devolver bytes del PDF
     return bytes(pdf.output())
 
-# Botón de Descarga
-st.subheader("Descargar Reporte")
-pdf_bytes = generar_pdf()
+# --- BOTÓN DE DESCARGA ---
+st.write("---")
+col_vacia, col_boton, col_vacia2 = st.columns([1, 2, 1])
 
-st.download_button(
-    label="📥 Descargar Reporte en PDF",
-    data=pdf_bytes,
-    file_name=f"Reporte_Retrabajo_{fecha_inicio}_al_{fecha_fin}.pdf",
-    mime="application/pdf"
-)
+with col_boton:
+    pdf_bytes = generar_pdf()
+    st.download_button(
+        label="📥 Descargar Reporte en PDF",
+        data=pdf_bytes,
+        file_name=f"Reporte_Retrabajo_{fecha_inicio}_al_{fecha_fin}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
