@@ -28,7 +28,6 @@ try:
     df['Cantidad de Pieza Scrap'] = pd.to_numeric(df['Cantidad de Pieza Scrap'], errors='coerce').fillna(0)
     df['Total Piezas Fila'] = df['Cantidad de Piezas OK'] + df['Cantidad de Pieza Scrap']
     
-    # Unificar nombres de piezas
     columnas_posibles = [
         'Piezas Fiat', 'Piezas Renault', 'Piezas Nissan', 
         'NISSAN SOLDADURA', 'Que pieza va a retrabajar?', 
@@ -45,7 +44,6 @@ try:
 
     df['Nombre Pieza'] = df.apply(obtener_nombre_pieza, axis=1)
     
-    # Unificar Códigos RT
     cols_codigo_rt = [col for col in df.columns if 'Codigo RT' in col]
     def obtener_codigo_rt(row):
         for col in cols_codigo_rt:
@@ -81,15 +79,20 @@ if df_filtrado.empty:
     st.stop()
 
 # --- CÁLCULOS PARA EL PDF ---
+# Función matematicamente más robusta para leer cualquier formato de hora
 def calcular_horas(df, col_inicio, col_fin):
     try:
-        inicio = pd.to_timedelta(df[col_inicio].astype(str).str.strip() + ':00', errors='coerce')
-        fin = pd.to_timedelta(df[col_fin].astype(str).str.strip() + ':00', errors='coerce')
+        inicio_str = df[col_inicio].astype(str).str.strip().replace('nan', '')
+        fin_str = df[col_fin].astype(str).str.strip().replace('nan', '')
+        
+        inicio = pd.to_datetime(inicio_str, errors='coerce')
+        fin = pd.to_datetime(fin_str, errors='coerce')
+        
         diferencia = (fin - inicio).dt.total_seconds() / 3600.0
-        diferencia = diferencia.apply(lambda x: x + 24 if x < 0 else x) 
+        diferencia = diferencia.apply(lambda x: x + 24 if pd.notnull(x) and x < 0 else x) 
         return diferencia.fillna(0)
-    except:
-        return pd.Series([0] * len(df))
+    except Exception:
+        return pd.Series([0.0] * len(df))
 
 df_filtrado['Tiempo de RT (hrs)'] = calcular_horas(df_filtrado, 'Inicio del Retrabajo', 'Fin del retrabajo')
 
@@ -118,14 +121,11 @@ piezas_scrap = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo Scr
 piezas_scrap = piezas_scrap[piezas_scrap['Cantidad_Scrap'] > 0].sort_values(by='Cantidad_Scrap', ascending=False)
 
 
-# --- CREACIÓN DEL GRÁFICO (IMAGEN) ---
+# --- CREACIÓN DEL GRÁFICO ---
 grafico_path = 'grafico_top15.png'
 if not top_15_piezas.empty:
     plt.figure(figsize=(10, 5))
-    # Ordenamos de menor a mayor para que el más alto quede arriba en el gráfico
     top_15_plot = top_15_piezas.sort_values(by='Total_Piezas', ascending=True)
-    
-    # Truncamos los nombres largos para que no arruinen el dibujo del gráfico
     nombres_cortos = [str(n)[:25] + "..." if len(str(n)) > 25 else str(n) for n in top_15_plot['Nombre Pieza']]
     
     plt.barh(nombres_cortos, top_15_plot['Total_Piezas'], color='#2c7bb6')
@@ -138,7 +138,6 @@ if not top_15_piezas.empty:
 
 # --- GENERACIÓN DEL PDF ---
 def generar_pdf():
-    # Iniciamos en formato Horizontal (Landscape - 'L')
     pdf = FPDF(orientation='L')
     pdf.add_page()
     
@@ -148,8 +147,6 @@ def generar_pdf():
     pdf.cell(0, 10, f"Periodo: {fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')}", ln=True, align='C')
     pdf.ln(5)
     
-    # ---------------------------------------------------------
-    # SECCIÓN 1: Resumen Global
     # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
     pdf.cell(0, 10, "1. Resumen Global", ln=True)
@@ -169,8 +166,6 @@ def generar_pdf():
     pdf.ln(5)
     
     # ---------------------------------------------------------
-    # SECCIÓN 2: Top 15 Piezas Retrabajadas (Tabla Ancha)
-    # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
     pdf.cell(0, 10, "2. Top 15 Piezas Retrabajadas", ln=True)
     
@@ -179,7 +174,6 @@ def generar_pdf():
         pdf.cell(0, 10, "No hay registros de piezas validas en este periodo.", ln=True)
     else:
         pdf.set_font("Helvetica", style="B", size=9)
-        # Anchos de columnas para hoja horizontal (Total ~265)
         pdf.cell(30, 8, "Cliente", border=1, align='C')
         pdf.cell(80, 8, "Pieza", border=1, align='C')
         pdf.cell(45, 8, "Cod. RT", border=1, align='C')
@@ -207,17 +201,13 @@ def generar_pdf():
             pdf.cell(25, 8, tiempo, border=1, align='C', ln=True)
             
     # ---------------------------------------------------------
-    # SECCIÓN 3: Gráfico del Top 15 (Nueva Página)
-    # ---------------------------------------------------------
     if os.path.exists(grafico_path):
         pdf.add_page()
         pdf.set_font("Helvetica", style="B", size=12)
         pdf.cell(0, 10, "Gráfico Analítico: Distribución de las Top 15 Piezas", ln=True)
-        pdf.image(grafico_path, x=20, w=240) # Insertamos la imagen guardada
-        os.remove(grafico_path) # Limpiamos la imagen para no ocupar espacio en el servidor
+        pdf.image(grafico_path, x=20, w=240)
+        os.remove(grafico_path)
     
-    # ---------------------------------------------------------
-    # SECCIÓN 4: Listado de Scrap (Nueva Página)
     # ---------------------------------------------------------
     pdf.add_page() 
     
