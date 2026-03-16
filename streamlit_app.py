@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from fpdf import FPDF
 import datetime
+import matplotlib.pyplot as plt
+import os
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Generador de Reportes", layout="centered")
@@ -21,14 +23,12 @@ def load_data(url):
 try:
     df = load_data(SHEET_URL)
     
-    # Convertir a formatos correctos
     df['Fecha'] = pd.to_datetime(df['Fecha'], format='%d/%m/%Y', errors='coerce')
     df['Cantidad de Piezas OK'] = pd.to_numeric(df['Cantidad de Piezas OK'], errors='coerce').fillna(0)
     df['Cantidad de Pieza Scrap'] = pd.to_numeric(df['Cantidad de Pieza Scrap'], errors='coerce').fillna(0)
-    
     df['Total Piezas Fila'] = df['Cantidad de Piezas OK'] + df['Cantidad de Pieza Scrap']
     
-    # --- LOGICA: NOMBRE DE LA PIEZA ---
+    # Unificar nombres de piezas
     columnas_posibles = [
         'Piezas Fiat', 'Piezas Renault', 'Piezas Nissan', 
         'NISSAN SOLDADURA', 'Que pieza va a retrabajar?', 
@@ -45,20 +45,16 @@ try:
 
     df['Nombre Pieza'] = df.apply(obtener_nombre_pieza, axis=1)
     
-    # --- LOGICA: CÓDIGO RT MAESTRO ---
-    # Pandas renombra columnas duplicadas como 'Codigo RT.1', 'Codigo RT.2', etc.
+    # Unificar Códigos RT
     cols_codigo_rt = [col for col in df.columns if 'Codigo RT' in col]
-    
     def obtener_codigo_rt(row):
         for col in cols_codigo_rt:
             val = str(row[col]).strip()
             if val and val.lower() not in ['nan', 'none', '']:
                 return val
-        return 'S/D' # Sin Dato
+        return 'S/D'
         
     df['Codigo RT Maestro'] = df.apply(obtener_codigo_rt, axis=1)
-    
-    # Asegurar que Cliente y Motivo de Scrap sean texto limpio
     df['Cliente'] = df['Cliente'].fillna('S/D').astype(str)
     df['Codigo Scrap'] = df['Codigo Scrap'].fillna('S/D').astype(str)
 
@@ -106,17 +102,44 @@ total_tiempo_rt = df_filtrado['Tiempo de RT (hrs)'].sum()
 # EXCLUIMOS LOS "SIN ESPECIFICAR"
 df_piezas_validas = df_filtrado[df_filtrado['Nombre Pieza'] != 'Sin especificar']
 
-# 2. Top 15 Piezas Retrabajadas (Agrupado por Cliente, Pieza y Codigo RT)
-top_15_piezas = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo RT Maestro'])['Total Piezas Fila'].sum().reset_index()
-top_15_piezas = top_15_piezas.sort_values(by='Total Piezas Fila', ascending=False).head(15)
+# 2. Agrupación Avanzada del Top 15
+top_15_piezas = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo RT Maestro']).agg(
+    Total_Piezas=('Total Piezas Fila', 'sum'),
+    OK=('Cantidad de Piezas OK', 'sum'),
+    Scrap=('Cantidad de Pieza Scrap', 'sum'),
+    Tiempo_RT=('Tiempo de RT (hrs)', 'sum')
+).reset_index()
+top_15_piezas = top_15_piezas.sort_values(by='Total_Piezas', ascending=False).head(15)
 
-# 3. Listado de Piezas con Scrap (Agrupado por Cliente, Pieza y Motivo/Codigo Scrap)
-piezas_scrap = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo Scrap'])['Cantidad de Pieza Scrap'].sum().reset_index()
-piezas_scrap = piezas_scrap[piezas_scrap['Cantidad de Pieza Scrap'] > 0].sort_values(by='Cantidad de Pieza Scrap', ascending=False)
+# 3. Listado de Piezas con Scrap
+piezas_scrap = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo Scrap']).agg(
+    Cantidad_Scrap=('Cantidad de Pieza Scrap', 'sum')
+).reset_index()
+piezas_scrap = piezas_scrap[piezas_scrap['Cantidad_Scrap'] > 0].sort_values(by='Cantidad_Scrap', ascending=False)
+
+
+# --- CREACIÓN DEL GRÁFICO (IMAGEN) ---
+grafico_path = 'grafico_top15.png'
+if not top_15_piezas.empty:
+    plt.figure(figsize=(10, 5))
+    # Ordenamos de menor a mayor para que el más alto quede arriba en el gráfico
+    top_15_plot = top_15_piezas.sort_values(by='Total_Piezas', ascending=True)
+    
+    # Truncamos los nombres largos para que no arruinen el dibujo del gráfico
+    nombres_cortos = [str(n)[:25] + "..." if len(str(n)) > 25 else str(n) for n in top_15_plot['Nombre Pieza']]
+    
+    plt.barh(nombres_cortos, top_15_plot['Total_Piezas'], color='#2c7bb6')
+    plt.xlabel('Cantidad Total Retrabajada')
+    plt.ylabel('Nombre de la Pieza')
+    plt.title('Top 15 Piezas con Mayor Retrabajo')
+    plt.tight_layout()
+    plt.savefig(grafico_path)
+    plt.close()
 
 # --- GENERACIÓN DEL PDF ---
 def generar_pdf():
-    pdf = FPDF()
+    # Iniciamos en formato Horizontal (Landscape - 'L')
+    pdf = FPDF(orientation='L')
     pdf.add_page()
     
     pdf.set_font("Helvetica", style="B", size=16)
@@ -132,21 +155,21 @@ def generar_pdf():
     pdf.cell(0, 10, "1. Resumen Global", ln=True)
     pdf.set_font("Helvetica", size=11)
     
-    pdf.cell(80, 8, "Total de Piezas Retrabajadas:", border=0)
-    pdf.cell(40, 8, str(int(total_piezas_retrabajadas)), border=0, ln=True)
+    pdf.cell(70, 7, "Total de Piezas Retrabajadas:", border=0)
+    pdf.cell(30, 7, str(int(total_piezas_retrabajadas)), border=0, ln=True)
     
-    pdf.cell(80, 8, "Total Piezas OK:", border=0)
-    pdf.cell(40, 8, str(int(total_ok)), border=0, ln=True)
+    pdf.cell(70, 7, "Total Piezas OK:", border=0)
+    pdf.cell(30, 7, str(int(total_ok)), border=0, ln=True)
     
-    pdf.cell(80, 8, "Total Piezas Scrap:", border=0)
-    pdf.cell(40, 8, str(int(total_scrap)), border=0, ln=True)
+    pdf.cell(70, 7, "Total Piezas Scrap:", border=0)
+    pdf.cell(30, 7, str(int(total_scrap)), border=0, ln=True)
     
-    pdf.cell(80, 8, "Tiempo Total de RT (Hrs):", border=0)
-    pdf.cell(40, 8, f"{total_tiempo_rt:.2f}", border=0, ln=True)
+    pdf.cell(70, 7, "Tiempo Total de RT (Hrs):", border=0)
+    pdf.cell(30, 7, f"{total_tiempo_rt:.2f}", border=0, ln=True)
     pdf.ln(5)
     
     # ---------------------------------------------------------
-    # SECCIÓN 2: Top 15 Piezas Retrabajadas
+    # SECCIÓN 2: Top 15 Piezas Retrabajadas (Tabla Ancha)
     # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
     pdf.cell(0, 10, "2. Top 15 Piezas Retrabajadas", ln=True)
@@ -156,28 +179,47 @@ def generar_pdf():
         pdf.cell(0, 10, "No hay registros de piezas validas en este periodo.", ln=True)
     else:
         pdf.set_font("Helvetica", style="B", size=9)
-        # Anchos de columnas (Total 190)
+        # Anchos de columnas para hoja horizontal (Total ~265)
         pdf.cell(30, 8, "Cliente", border=1, align='C')
-        pdf.cell(85, 8, "Pieza", border=1, align='C')
-        pdf.cell(50, 8, "Cod. RT", border=1, align='C')
-        pdf.cell(25, 8, "Total", border=1, align='C', ln=True)
+        pdf.cell(80, 8, "Pieza", border=1, align='C')
+        pdf.cell(45, 8, "Cod. RT", border=1, align='C')
+        pdf.cell(25, 8, "Cant. OK", border=1, align='C')
+        pdf.cell(25, 8, "Scrap", border=1, align='C')
+        pdf.cell(25, 8, "Total", border=1, align='C')
+        pdf.cell(25, 8, "Tiempo RT", border=1, align='C', ln=True)
         
         pdf.set_font("Helvetica", size=8)
         for _, row in top_15_piezas.iterrows():
             cliente = str(row['Cliente'])[:15]
-            pieza = str(row['Nombre Pieza'])[:55] 
-            cod_rt = str(row['Codigo RT Maestro'])[:30]
-            cantidad = str(int(row['Total Piezas Fila']))
+            pieza = str(row['Nombre Pieza'])[:50] 
+            cod_rt = str(row['Codigo RT Maestro'])[:25]
+            ok = str(int(row['OK']))
+            scrap = str(int(row['Scrap']))
+            total = str(int(row['Total_Piezas']))
+            tiempo = f"{row['Tiempo_RT']:.2f}h"
             
             pdf.cell(30, 8, cliente, border=1)
-            pdf.cell(85, 8, pieza, border=1)
-            pdf.cell(50, 8, cod_rt, border=1)
-            pdf.cell(25, 8, cantidad, border=1, align='C', ln=True)
+            pdf.cell(80, 8, pieza, border=1)
+            pdf.cell(45, 8, cod_rt, border=1)
+            pdf.cell(25, 8, ok, border=1, align='C')
+            pdf.cell(25, 8, scrap, border=1, align='C')
+            pdf.cell(25, 8, total, border=1, align='C')
+            pdf.cell(25, 8, tiempo, border=1, align='C', ln=True)
+            
+    # ---------------------------------------------------------
+    # SECCIÓN 3: Gráfico del Top 15 (Nueva Página)
+    # ---------------------------------------------------------
+    if os.path.exists(grafico_path):
+        pdf.add_page()
+        pdf.set_font("Helvetica", style="B", size=12)
+        pdf.cell(0, 10, "Gráfico Analítico: Distribución de las Top 15 Piezas", ln=True)
+        pdf.image(grafico_path, x=20, w=240) # Insertamos la imagen guardada
+        os.remove(grafico_path) # Limpiamos la imagen para no ocupar espacio en el servidor
     
     # ---------------------------------------------------------
-    # SECCIÓN 3: Listado de Scrap (¡NUEVA PÁGINA!)
+    # SECCIÓN 4: Listado de Scrap (Nueva Página)
     # ---------------------------------------------------------
-    pdf.add_page() # Esto fuerza a que inicie en una hoja en blanco
+    pdf.add_page() 
     
     pdf.set_font("Helvetica", style="B", size=12)
     pdf.cell(0, 10, "3. Resumen de Scrap", ln=True)
@@ -188,23 +230,22 @@ def generar_pdf():
         pdf.cell(0, 10, "No se registraron piezas con Scrap en este periodo.", ln=True)
     else:
         pdf.set_font("Helvetica", style="B", size=9)
-        # Anchos de columnas (Total 190)
         pdf.cell(30, 8, "Cliente", border=1, align='C')
-        pdf.cell(85, 8, "Pieza", border=1, align='C')
-        pdf.cell(50, 8, "Motivo (Cod. Scrap)", border=1, align='C')
-        pdf.cell(25, 8, "Cant. Scrap", border=1, align='C', ln=True)
+        pdf.cell(100, 8, "Pieza", border=1, align='C')
+        pdf.cell(90, 8, "Motivo (Cod. Scrap)", border=1, align='C')
+        pdf.cell(35, 8, "Cant. Scrap", border=1, align='C', ln=True)
         
         pdf.set_font("Helvetica", size=8)
         for _, row in piezas_scrap.iterrows():
             cliente = str(row['Cliente'])[:15]
-            pieza = str(row['Nombre Pieza'])[:55]
-            motivo = str(row['Codigo Scrap'])[:30]
-            cantidad_scrap = str(int(row['Cantidad de Pieza Scrap']))
+            pieza = str(row['Nombre Pieza'])[:65]
+            motivo = str(row['Codigo Scrap'])[:55]
+            cantidad_scrap = str(int(row['Cantidad_Scrap']))
             
             pdf.cell(30, 8, cliente, border=1)
-            pdf.cell(85, 8, pieza, border=1)
-            pdf.cell(50, 8, motivo, border=1)
-            pdf.cell(25, 8, cantidad_scrap, border=1, align='C', ln=True)
+            pdf.cell(100, 8, pieza, border=1)
+            pdf.cell(90, 8, motivo, border=1)
+            pdf.cell(35, 8, cantidad_scrap, border=1, align='C', ln=True)
 
     return bytes(pdf.output())
 
@@ -215,7 +256,7 @@ col_vacia, col_boton, col_vacia2 = st.columns([1, 2, 1])
 with col_boton:
     pdf_bytes = generar_pdf()
     st.download_button(
-        label="📥 Descargar Reporte en PDF",
+        label="📥 Descargar Reporte Completo en PDF",
         data=pdf_bytes,
         file_name=f"Reporte_Retrabajo_{fecha_inicio}_al_{fecha_fin}.pdf",
         mime="application/pdf",
