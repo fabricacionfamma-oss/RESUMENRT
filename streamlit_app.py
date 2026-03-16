@@ -4,7 +4,6 @@ from fpdf import FPDF
 import datetime
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-# Usamos un layout centrado para que se vea más limpio
 st.set_page_config(page_title="Generador de Reportes", layout="centered")
 
 st.title("📄 Reporte de Retrabajo")
@@ -27,11 +26,41 @@ try:
     df['Cantidad de Piezas OK'] = pd.to_numeric(df['Cantidad de Piezas OK'], errors='coerce').fillna(0)
     df['Cantidad de Pieza Scrap'] = pd.to_numeric(df['Cantidad de Pieza Scrap'], errors='coerce').fillna(0)
     
-    # Crear columna de total por fila para facilitar los cálculos del Top 15
     df['Total Piezas Fila'] = df['Cantidad de Piezas OK'] + df['Cantidad de Pieza Scrap']
     
-    # Asegurar que la columna de piezas sea texto
-    df['Que pieza va a retrabajar?'] = df['Que pieza va a retrabajar?'].fillna('Sin especificar').astype(str)
+    # --- LOGICA: NOMBRE DE LA PIEZA ---
+    columnas_posibles = [
+        'Piezas Fiat', 'Piezas Renault', 'Piezas Nissan', 
+        'NISSAN SOLDADURA', 'Que pieza va a retrabajar?', 
+        'Piezas Renault Soldadura', 'PIEZA'
+    ]
+    cols_piezas = [col for col in columnas_posibles if col in df.columns]
+
+    def obtener_nombre_pieza(row):
+        for col in cols_piezas:
+            val = str(row[col]).strip()
+            if val and val.lower() not in ['nan', 'none', '']:
+                return val
+        return 'Sin especificar'
+
+    df['Nombre Pieza'] = df.apply(obtener_nombre_pieza, axis=1)
+    
+    # --- LOGICA: CÓDIGO RT MAESTRO ---
+    # Pandas renombra columnas duplicadas como 'Codigo RT.1', 'Codigo RT.2', etc.
+    cols_codigo_rt = [col for col in df.columns if 'Codigo RT' in col]
+    
+    def obtener_codigo_rt(row):
+        for col in cols_codigo_rt:
+            val = str(row[col]).strip()
+            if val and val.lower() not in ['nan', 'none', '']:
+                return val
+        return 'S/D' # Sin Dato
+        
+    df['Codigo RT Maestro'] = df.apply(obtener_codigo_rt, axis=1)
+    
+    # Asegurar que Cliente y Motivo de Scrap sean texto limpio
+    df['Cliente'] = df['Cliente'].fillna('S/D').astype(str)
+    df['Codigo Scrap'] = df['Codigo Scrap'].fillna('S/D').astype(str)
 
 except Exception as e:
     st.error(f"Error general al conectarse con el Google Sheet. Detalles: {e}")
@@ -48,7 +77,6 @@ with col1:
 with col2:
     fecha_fin = st.date_input("Fecha de Fin", max_date)
 
-# Filtrar dataframe
 mask = (df['Fecha'].dt.date >= fecha_inicio) & (df['Fecha'].dt.date <= fecha_fin)
 df_filtrado = df.loc[mask].copy()
 
@@ -57,32 +85,33 @@ if df_filtrado.empty:
     st.stop()
 
 # --- CÁLCULOS PARA EL PDF ---
-# 1. Calcular el tiempo de RT (Fin - Inicio)
 def calcular_horas(df, col_inicio, col_fin):
     try:
         inicio = pd.to_timedelta(df[col_inicio].astype(str).str.strip() + ':00', errors='coerce')
         fin = pd.to_timedelta(df[col_fin].astype(str).str.strip() + ':00', errors='coerce')
         diferencia = (fin - inicio).dt.total_seconds() / 3600.0
-        diferencia = diferencia.apply(lambda x: x + 24 if x < 0 else x) # Por si pasa la medianoche
+        diferencia = diferencia.apply(lambda x: x + 24 if x < 0 else x) 
         return diferencia.fillna(0)
     except:
         return pd.Series([0] * len(df))
 
 df_filtrado['Tiempo de RT (hrs)'] = calcular_horas(df_filtrado, 'Inicio del Retrabajo', 'Fin del retrabajo')
 
-# Totales Superiores
+# 1. Totales Superiores
 total_ok = df_filtrado['Cantidad de Piezas OK'].sum()
 total_scrap = df_filtrado['Cantidad de Pieza Scrap'].sum()
 total_piezas_retrabajadas = total_ok + total_scrap
 total_tiempo_rt = df_filtrado['Tiempo de RT (hrs)'].sum()
 
-# 2. Top 15 Piezas Retrabajadas
-top_15_piezas = df_filtrado.groupby('Que pieza va a retrabajar?')['Total Piezas Fila'].sum().reset_index()
+# EXCLUIMOS LOS "SIN ESPECIFICAR"
+df_piezas_validas = df_filtrado[df_filtrado['Nombre Pieza'] != 'Sin especificar']
+
+# 2. Top 15 Piezas Retrabajadas (Agrupado por Cliente, Pieza y Codigo RT)
+top_15_piezas = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo RT Maestro'])['Total Piezas Fila'].sum().reset_index()
 top_15_piezas = top_15_piezas.sort_values(by='Total Piezas Fila', ascending=False).head(15)
 
-# 3. Listado de Piezas con Scrap
-piezas_scrap = df_filtrado.groupby('Que pieza va a retrabajar?')['Cantidad de Pieza Scrap'].sum().reset_index()
-# Filtramos solo las que tienen scrap mayor a 0 y ordenamos de mayor a menor
+# 3. Listado de Piezas con Scrap (Agrupado por Cliente, Pieza y Motivo/Codigo Scrap)
+piezas_scrap = df_piezas_validas.groupby(['Cliente', 'Nombre Pieza', 'Codigo Scrap'])['Cantidad de Pieza Scrap'].sum().reset_index()
 piezas_scrap = piezas_scrap[piezas_scrap['Cantidad de Pieza Scrap'] > 0].sort_values(by='Cantidad de Pieza Scrap', ascending=False)
 
 # --- GENERACIÓN DEL PDF ---
@@ -90,7 +119,6 @@ def generar_pdf():
     pdf = FPDF()
     pdf.add_page()
     
-    # Título y Periodo
     pdf.set_font("Helvetica", style="B", size=16)
     pdf.cell(0, 10, "Reporte de Retrabajo de Piezas", ln=True, align='C')
     pdf.set_font("Helvetica", size=11)
@@ -98,13 +126,12 @@ def generar_pdf():
     pdf.ln(5)
     
     # ---------------------------------------------------------
-    # SECCIÓN 1: TOTALES GLOBALES
+    # SECCIÓN 1: Resumen Global
     # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
     pdf.cell(0, 10, "1. Resumen Global", ln=True)
     pdf.set_font("Helvetica", size=11)
     
-    # Dibujamos un pequeño cuadro de resumen
     pdf.cell(80, 8, "Total de Piezas Retrabajadas:", border=0)
     pdf.cell(40, 8, str(int(total_piezas_retrabajadas)), border=0, ln=True)
     
@@ -119,53 +146,66 @@ def generar_pdf():
     pdf.ln(5)
     
     # ---------------------------------------------------------
-    # SECCIÓN 2: TOP 15 PIEZAS RETRABAJADAS
+    # SECCIÓN 2: Top 15 Piezas Retrabajadas
     # ---------------------------------------------------------
     pdf.set_font("Helvetica", style="B", size=12)
     pdf.cell(0, 10, "2. Top 15 Piezas Retrabajadas", ln=True)
     
-    # Encabezados de tabla
-    pdf.set_font("Helvetica", style="B", size=10)
-    pdf.cell(140, 8, "Nombre de la Pieza", border=1, align='C')
-    pdf.cell(40, 8, "Cantidad Total", border=1, align='C', ln=True)
-    
-    # Filas de tabla
-    pdf.set_font("Helvetica", size=9)
-    for _, row in top_15_piezas.iterrows():
-        # Truncar el nombre de la pieza a 80 caracteres para que no rompa la tabla
-        nombre_pieza = str(row['Que pieza va a retrabajar?'])[:80] 
-        cantidad = str(int(row['Total Piezas Fila']))
+    if top_15_piezas.empty:
+        pdf.set_font("Helvetica", size=10)
+        pdf.cell(0, 10, "No hay registros de piezas validas en este periodo.", ln=True)
+    else:
+        pdf.set_font("Helvetica", style="B", size=9)
+        # Anchos de columnas (Total 190)
+        pdf.cell(30, 8, "Cliente", border=1, align='C')
+        pdf.cell(85, 8, "Pieza", border=1, align='C')
+        pdf.cell(50, 8, "Cod. RT", border=1, align='C')
+        pdf.cell(25, 8, "Total", border=1, align='C', ln=True)
         
-        pdf.cell(140, 8, nombre_pieza, border=1)
-        pdf.cell(40, 8, cantidad, border=1, align='C', ln=True)
-    
-    pdf.ln(5)
+        pdf.set_font("Helvetica", size=8)
+        for _, row in top_15_piezas.iterrows():
+            cliente = str(row['Cliente'])[:15]
+            pieza = str(row['Nombre Pieza'])[:55] 
+            cod_rt = str(row['Codigo RT Maestro'])[:30]
+            cantidad = str(int(row['Total Piezas Fila']))
+            
+            pdf.cell(30, 8, cliente, border=1)
+            pdf.cell(85, 8, pieza, border=1)
+            pdf.cell(50, 8, cod_rt, border=1)
+            pdf.cell(25, 8, cantidad, border=1, align='C', ln=True)
     
     # ---------------------------------------------------------
-    # SECCIÓN 3: PIEZAS QUE GENERARON SCRAP
+    # SECCIÓN 3: Listado de Scrap (¡NUEVA PÁGINA!)
     # ---------------------------------------------------------
+    pdf.add_page() # Esto fuerza a que inicie en una hoja en blanco
+    
     pdf.set_font("Helvetica", style="B", size=12)
-    pdf.cell(0, 10, "3. Listado de Piezas con Scrap", ln=True)
+    pdf.cell(0, 10, "3. Resumen de Scrap", ln=True)
+    pdf.ln(2)
     
     if piezas_scrap.empty:
         pdf.set_font("Helvetica", size=10)
         pdf.cell(0, 10, "No se registraron piezas con Scrap en este periodo.", ln=True)
     else:
-        # Encabezados de tabla
-        pdf.set_font("Helvetica", style="B", size=10)
-        pdf.cell(140, 8, "Nombre de la Pieza", border=1, align='C')
-        pdf.cell(40, 8, "Cantidad Scrap", border=1, align='C', ln=True)
+        pdf.set_font("Helvetica", style="B", size=9)
+        # Anchos de columnas (Total 190)
+        pdf.cell(30, 8, "Cliente", border=1, align='C')
+        pdf.cell(85, 8, "Pieza", border=1, align='C')
+        pdf.cell(50, 8, "Motivo (Cod. Scrap)", border=1, align='C')
+        pdf.cell(25, 8, "Cant. Scrap", border=1, align='C', ln=True)
         
-        # Filas de tabla
-        pdf.set_font("Helvetica", size=9)
+        pdf.set_font("Helvetica", size=8)
         for _, row in piezas_scrap.iterrows():
-            nombre_pieza = str(row['Que pieza va a retrabajar?'])[:80]
+            cliente = str(row['Cliente'])[:15]
+            pieza = str(row['Nombre Pieza'])[:55]
+            motivo = str(row['Codigo Scrap'])[:30]
             cantidad_scrap = str(int(row['Cantidad de Pieza Scrap']))
             
-            pdf.cell(140, 8, nombre_pieza, border=1)
-            pdf.cell(40, 8, cantidad_scrap, border=1, align='C', ln=True)
+            pdf.cell(30, 8, cliente, border=1)
+            pdf.cell(85, 8, pieza, border=1)
+            pdf.cell(50, 8, motivo, border=1)
+            pdf.cell(25, 8, cantidad_scrap, border=1, align='C', ln=True)
 
-    # Devolver bytes del PDF
     return bytes(pdf.output())
 
 # --- BOTÓN DE DESCARGA ---
